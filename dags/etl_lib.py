@@ -125,23 +125,101 @@ def ingest_raw():
     return str(dest)
 
 
-def extract():
-    """Đọc dữ liệu thô từ Data Lake (phân vùng mới nhất) và lưu bản staging."""
-    STAGING.mkdir(parents=True, exist_ok=True)
+SPLIT_DATASETS = ("products", "customers", "orders")
+ORIGINAL_COLUMNS = ["Invoice", "StockCode", "Description", "Quantity", "InvoiceDate",
+                    "Price", "Customer ID", "Country"]
+
+
+def _read_original():
+    """Đọc file nguồn gốc (csv ưu tiên, không có thì xlsx) ở phân vùng mới nhất của Data Lake."""
     src_dir = latest_raw_dir()
     csv_path = src_dir / "online_retail_II.csv"
     xlsx_path = src_dir / "online_retail_II.xlsx"
     dtypes = {"Invoice": str, "StockCode": str}
     if csv_path.exists():
-        df = pd.read_csv(csv_path, dtype=dtypes, parse_dates=["InvoiceDate"],
-                         encoding_errors="replace")
-    elif xlsx_path.exists():
+        return pd.read_csv(csv_path, dtype=dtypes, parse_dates=["InvoiceDate"],
+                           encoding_errors="replace")
+    if xlsx_path.exists():
         sheets = pd.read_excel(xlsx_path, sheet_name=None, dtype=dtypes)  # chậm: vài phút
-        df = pd.concat(sheets.values(), ignore_index=True)
-    else:
-        raise FileNotFoundError(f"Không thấy online_retail_II.xlsx/.csv trong {src_dir}")
+        return pd.concat(sheets.values(), ignore_index=True)
+    raise FileNotFoundError(f"Không thấy online_retail_II.xlsx/.csv trong {src_dir}")
+
+
+def _top_value(df, key, col):
+    """Giá trị xuất hiện nhiều nhất của `col` cho mỗi `key` (bỏ qua ô trống, hòa thì lấy theo thứ tự chữ)."""
+    cnt = df.dropna(subset=[col]).groupby([key, col]).size().reset_index(name="n")
+    cnt = cnt.sort_values([key, "n", col], ascending=[True, False, True])
+    return cnt.drop_duplicates(key)[[key, col]]
+
+
+def _write_split(name, frame, part, now):
+    dest = LAKE_RAW / SOURCE / name / part
+    dest.mkdir(parents=True, exist_ok=True)
+    fname = f"{name}.csv"
+    frame.to_csv(dest / fname, index=False, encoding="utf-8")
+    manifest = {
+        "source": SOURCE, "source_type": "file", "dataset": name,
+        "derived_from": DATASET,
+        "note": "Tập do nhóm tách từ bảng giao dịch Online Retail II (cùng một nguồn Kaggle)",
+        "ingested_at_utc": now.isoformat(timespec="seconds"), "rows": int(len(frame)),
+        "files": [{"file": fname, "size_bytes": (dest / fname).stat().st_size,
+                   "sha256": _sha256(dest / fname)}],
+    }
+    (dest / "_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                                         encoding="utf-8")
+    log.info("Đã ghi tập %s: %s dòng -> %s", name, f"{len(frame):,}", dest)
+
+
+def split_sources():
+    """Tách bảng giao dịch thành 3 tập Products, Customers, Orders trong tầng raw của Data Lake."""
+    df = _read_original()
+    now = datetime.now(timezone.utc)
+    part = f"ingest_date={now.date().isoformat()}"
+
+    # Products: mỗi mã sản phẩm 1 dòng - mô tả phổ biến nhất và giá niêm yết (trung vị giá bán)
+    list_price = (df[df["Price"] > 0].groupby("StockCode")["Price"].median()
+                  .rename("ListPrice").reset_index())
+    products = (df[["StockCode"]].drop_duplicates()
+                .merge(_top_value(df, "StockCode", "Description"), on="StockCode", how="left")
+                .merge(list_price, on="StockCode", how="left")
+                .sort_values("StockCode"))
+
+    # Customers: mỗi khách 1 dòng - quốc gia xuất hiện nhiều nhất
+    known = df.dropna(subset=["Customer ID"]).copy()
+    known["Customer ID"] = known["Customer ID"].astype(int)
+    customers = (known[["Customer ID"]].drop_duplicates()
+                 .merge(_top_value(known, "Customer ID", "Country"), on="Customer ID", how="left")
+                 .sort_values("Customer ID"))
+
+    # Orders: mỗi dòng hàng trong hóa đơn (giữ cả dòng không có mã khách để không mất dữ liệu thô)
+    orders = df[["Invoice", "StockCode", "Quantity", "InvoiceDate", "Price", "Customer ID"]].copy()
+    orders["Customer ID"] = orders["Customer ID"].astype("Int64")
+
+    for name, frame in (("products", products), ("customers", customers), ("orders", orders)):
+        _write_split(name, frame, part, now)
+    return {"products": len(products), "customers": len(customers), "orders": len(orders)}
+
+
+def _latest_split_file(name):
+    parts = sorted((LAKE_RAW / SOURCE / name).glob("ingest_date=*"))
+    if not parts:
+        raise FileNotFoundError(f"Data Lake chưa có tập {name} tại {LAKE_RAW / SOURCE / name}")
+    return parts[-1] / f"{name}.csv"
+
+
+def extract():
+    """Đọc 3 tập từ Data Lake, ghép lại thành bảng giao dịch và lưu bản staging."""
+    STAGING.mkdir(parents=True, exist_ok=True)
+    orders = pd.read_csv(_latest_split_file("orders"), parse_dates=["InvoiceDate"],
+                         dtype={"Invoice": str, "StockCode": str, "Customer ID": "Int64"})
+    products = pd.read_csv(_latest_split_file("products"), dtype={"StockCode": str})
+    customers = pd.read_csv(_latest_split_file("customers"), dtype={"Customer ID": "Int64"})
+    df = (orders.merge(products[["StockCode", "Description"]], on="StockCode", how="left")
+                .merge(customers, on="Customer ID", how="left"))
+    df = df[ORIGINAL_COLUMNS]
     df.to_parquet(RAW_PARQUET, index=False)
-    log.info("Extract: %s dòng", f"{len(df):,}")
+    log.info("Extract: %s dòng (orders=%s, products=%s, customers=%s)", f"{len(df):,}",
+             f"{len(orders):,}", f"{len(products):,}", f"{len(customers):,}")
     return len(df)
 
 

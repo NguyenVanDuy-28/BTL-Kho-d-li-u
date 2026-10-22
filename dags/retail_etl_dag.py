@@ -18,6 +18,7 @@ with DAG(
     tags=["kdl", "retail"],
 ) as dag:
     t_ingest = PythonOperator(task_id="ingest_raw", python_callable=etl.ingest_raw)
+    t_split = PythonOperator(task_id="split_sources", python_callable=etl.split_sources)
     t_schema = PythonOperator(task_id="create_schema", python_callable=etl.create_schema)
     t_extract = PythonOperator(task_id="extract", python_callable=etl.extract)
     t_transform = PythonOperator(task_id="transform", python_callable=etl.transform)
@@ -26,4 +27,4 @@ with DAG(
     t_rfm = PythonOperator(task_id="rfm_kmeans", python_callable=etl.rfm_kmeans)
     t_validate = PythonOperator(task_id="validate", python_callable=etl.validate)
 
-    t_ingest >> t_schema >> t_extract >> t_transform >> t_dims >> t_fact >> t_rfm >> t_validate
+    t_ingest >> t_split >> t_schema >> t_extract >> t_transform >> t_dims >> t_fact >> t_rfm >> t_validate
